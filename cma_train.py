@@ -6,27 +6,24 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.svm import LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 import pickle
 import os
 
+# --- NEW: HUGGING FACE TOKENIZERS ---
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import Whitespace
+
 # --- CONFIG ---
-DATA_FILE = "text_konkani.json"
-MAX_LEN, EMBED_DIM, BATCH_SIZE, EPOCHS, LR = 32, 64, 16, 400, 5e-4
+DATA_FILE = "text_konkani_boosted.json"
+MAX_LEN, EMBED_DIM, BATCH_SIZE, EPOCHS, LR = 32, 64, 512, 400, 5e-4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- TOKENIZER ---
-def tokenize(text):
-    text = text.lower().strip()
-    tokens = []
-    for w in text.split():
-        tokens.append(w)
-        if len(w) > 3:
-            tokens.append(w[:3])
-            tokens.append(w[-3:])
-    return tokens
-
-def encode_text(text, vocab):
-    ids = [vocab.get(t, 1) for t in tokenize(text)][:MAX_LEN]
+def encode_text(text, tokenizer):
+    ids = tokenizer.encode(str(text).lower().strip()).ids[:MAX_LEN]
     return ids + [0] * (MAX_LEN - len(ids))
 
 # --- MODEL ARCHITECTURES ---
@@ -57,35 +54,51 @@ class CNNClassifier(nn.Module):
 # --- TRAINING LOGIC ---
 def train():
     if not os.path.exists(DATA_FILE):
-        print(f"Error: {DATA_FILE} not found!")
+        print(f"Error: {DATA_FILE} not found! Did you run the injector script?")
         return
 
     with open(DATA_FILE, encoding="utf-8") as f:
         data_json = json.load(f)
 
-    texts, labels, vocab = [], [], {"<PAD>": 0, "<UNK>": 1}
+    texts, labels = [], []
     for idx, cat in enumerate(["negative", "neutral", "positive"]):
         for t in data_json[cat]:
             texts.append(t)
             labels.append(idx)
-            for tok in tokenize(t):
-                if tok not in vocab: vocab[tok] = len(vocab)
 
-    # 1. Train SVM
+    train_texts, test_texts, train_labels, test_labels = train_test_split(
+        texts, labels, test_size=0.2, random_state=42, stratify=labels
+    )
+    print(f"Train_length:{len(train_texts)} Test_length:{len(test_texts)}")
+    
+    # --- TRAIN BPE TOKENIZER ---
+    print("Training Sub-word BPE Tokenizer on Konkani data...")
+    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    trainer = BpeTrainer(special_tokens=["[PAD]", "[UNK]"], vocab_size=5000)
+    tokenizer.train_from_iterator(train_texts, trainer)
+    tokenizer.save("konkani_bpe.json")
+    vocab_size = tokenizer.get_vocab_size()
+    print(f"BPE Tokenizer saved. Vocab size: {vocab_size}")
+
+    # --- TRAIN SVM ---
     print("Training SVM...")
-    tfidf = TfidfVectorizer(tokenizer=tokenize, token_pattern=None)
-    x_tfidf = tfidf.fit_transform(texts)
-    svm = CalibratedClassifierCV(LinearSVC(dual=False)).fit(x_tfidf, labels)
+    # We still use basic split for TFIDF, but BPE for Neural Networks
+    tfidf = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b") 
+    x_train_tfidf = tfidf.fit_transform(train_texts)
+    x_test_tfidf = tfidf.transform(test_texts)
+    
+    svm = CalibratedClassifierCV(LinearSVC(dual=False)).fit(x_train_tfidf, train_labels)
     with open("svm_hybrid.pkl", "wb") as f:
         pickle.dump((svm, tfidf), f)
 
-    # 2. Train Neural Networks
-    input_ids = torch.tensor([encode_text(t, vocab) for t in texts])
-    label_ts = torch.tensor(labels)
+    # --- TRAIN NEURAL NETWORKS ---
+    input_ids = torch.tensor([encode_text(t, tokenizer) for t in train_texts])
+    label_ts = torch.tensor(train_labels)
     loader = DataLoader(TensorDataset(input_ids, label_ts), batch_size=BATCH_SIZE, shuffle=True)
 
-    t_model = TransformerClassifier(len(vocab)).to(device)
-    c_model = CNNClassifier(len(vocab)).to(device)
+    t_model = TransformerClassifier(vocab_size).to(device)
+    c_model = CNNClassifier(vocab_size).to(device)
     optimizer = optim.Adam(list(t_model.parameters()) + list(c_model.parameters()), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
@@ -98,10 +111,38 @@ def train():
             loss = criterion(t_model(bx), by) + criterion(c_model(bx), by)
             loss.backward()
             optimizer.step()
-        if (epoch+1) % 1 == 0: print(f"Epoch {epoch+1} complete.")
+        if (epoch+1) % 50 == 0: print(f"Epoch {epoch+1} complete.")
 
-    torch.save({"transformer": t_model.state_dict(), "cnn": c_model.state_dict(), "vocab": vocab}, "nn_hybrid.pth")
-    print("✅ All models saved successfully!")
+    torch.save({"transformer": t_model.state_dict(), "cnn": c_model.state_dict(), "vocab_size": vocab_size}, "nn_hybrid.pth")
+    
+    # --- EVALUATION ---
+    print("\n--- TEST DATA EVALUATION ---")
+    t_model.eval(); c_model.eval()
+    test_ids = torch.tensor([encode_text(t, tokenizer) for t in test_texts])
+    hybrid_preds = []
+    confidences = [] # Tracking confidence scores
+    
+    with torch.no_grad():
+        for i in range(len(test_texts)):
+            p_s = torch.tensor(svm.predict_proba(x_test_tfidf[i])[0]).to(device)
+            inp_nn = test_ids[i].unsqueeze(0).to(device)
+            p_t = torch.softmax(t_model(inp_nn), dim=1)[0]
+            p_c = torch.softmax(c_model(inp_nn), dim=1)[0]
+            
+            # Combine probabilities based on weights
+            final_p = (0.4 * p_t) + (0.3 * p_c) + (0.3 * p_s)
+            
+            # Record the highest probability (confidence) and the predicted label
+            conf, pred = torch.max(final_p, dim=0)
+            hybrid_preds.append(pred.item())
+            confidences.append(conf.item())
+
+    # Print the Precision/Recall/F1-score table
+    print(classification_report(test_labels, hybrid_preds, target_names=["Negative", "Neutral", "Positive"]))
+    
+    # Calculate and print Average Confidence
+    avg_conf = sum(confidences) / len(confidences)
+    print(f"Average Model Confidence: {avg_conf * 100:.2f}%\n")
 
 if __name__ == "__main__":
     train()

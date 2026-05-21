@@ -2,22 +2,13 @@ import torch
 import torch.nn as nn
 import pickle
 import os
+from tokenizers import Tokenizer
 
-# Copying class definitions so torch can load them
 MAX_LEN, EMBED_DIM = 32, 64
-TEMPERATURE = 1.0  # Reduced from 1.5 for better confidence
+TEMPERATURE = 1.0 
 
-def tokenize(text):
-    text = text.lower().strip()
-    tokens = []
-    for w in text.split():
-        tokens.append(w)
-        if len(w) > 3:
-            tokens.append(w[:3]); tokens.append(w[-3:])
-    return tokens
-
-def encode_text(text, vocab):
-    ids = [vocab.get(t, 1) for t in tokenize(text)][:MAX_LEN]
+def encode_text(text, tokenizer):
+    ids = tokenizer.encode(str(text).lower().strip()).ids[:MAX_LEN]
     return ids + [0] * (MAX_LEN - len(ids))
 
 class TransformerClassifier(nn.Module):
@@ -44,15 +35,19 @@ class CNNClassifier(nn.Module):
         x = torch.max(x, dim=2)[0]
         return self.fc(x)
 
-# --- LOAD MODELS ---
-if not os.path.exists("nn_hybrid.pth") or not os.path.exists("svm_hybrid.pkl"):
-    print("Error: Model files not found. Run cma_train.py first!")
+if not os.path.exists("nn_hybrid.pth") or not os.path.exists("konkani_bpe.json"):
+    print("Error: Model or Tokenizer files not found. Run cma_train.py first!")
     exit()
 
+# Load Tokenizer
+tokenizer = Tokenizer.from_file("konkani_bpe.json")
+
+# Load Models
 nn_data = torch.load("nn_hybrid.pth", map_location="cpu")
-vocab = nn_data["vocab"]
-t_model = TransformerClassifier(len(vocab))
-c_model = CNNClassifier(len(vocab))
+vocab_size = nn_data["vocab_size"]
+
+t_model = TransformerClassifier(vocab_size)
+c_model = CNNClassifier(vocab_size)
 t_model.load_state_dict(nn_data["transformer"])
 c_model.load_state_dict(nn_data["cnn"])
 t_model.eval(); c_model.eval()
@@ -60,20 +55,22 @@ t_model.eval(); c_model.eval()
 with open("svm_hybrid.pkl", "rb") as f:
     svm, tfidf = pickle.load(f)
 
-print("--- KONKANI HYBRID AI LOADED ---")
+print("--- KONKANI HYBRID AI (BPE UPGRADED) LOADED ---")
 
 while True:
     text = input("\nYou: ").strip()
     if not text or text.lower() == "exit": break
 
-    inp_nn = torch.tensor([encode_text(text, vocab)])
+    # Debug: See how the model is splitting your words into sub-words!
+    print(f"DEBUG BPE Tokens: {tokenizer.encode(text).tokens}")
+
+    inp_nn = torch.tensor([encode_text(text, tokenizer)])
     with torch.no_grad():
         p_t = torch.softmax(t_model(inp_nn) / TEMPERATURE, dim=1)[0]
         p_c = torch.softmax(c_model(inp_nn) / TEMPERATURE, dim=1)[0]
-    
+
     p_s = torch.tensor(svm.predict_proba(tfidf.transform([text]))[0])
 
-    # Combined Probability (Weighted Ensemble)
     final_p = (0.4 * p_t) + (0.3 * p_c) + (0.3 * p_s)
     labels = ["Negative", "Neutral", "Positive"]
     idx = torch.argmax(final_p).item()
